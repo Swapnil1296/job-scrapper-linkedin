@@ -45,7 +45,7 @@ async function sendApplicationReport(appliedJobs = []) {
 
   try {
     await sendEmailNotification(`LinkedIn Job Report`, emailHtml);
-    console.log("Application report email sent successfully to", to);
+    console.log("Application report email sent successfully");
   } catch (error) {
     console.error("Failed to send application report email:", error);
   }

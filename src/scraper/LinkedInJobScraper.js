@@ -116,7 +116,7 @@ class LinkedInJobScraper {
   async scrapeJobs(searchParams = {}, totalJobs = 0) {
     const jobs = [];
     const jobsPerPage = 25;
-    const totalPages = Math.min(Math.ceil(totalJobs / jobsPerPage), 1);
+    const totalPages = Math.max(Math.ceil(totalJobs / jobsPerPage), 1);
 
     console.log(
       `Total pages to scrape: ${totalPages} (Total Jobs: ${totalJobs})`
@@ -264,199 +264,159 @@ class LinkedInJobScraper {
 
   async handleApplyButton() {
     try {
-      // Add a longer timeout for slow connections
+      // Wait for job details to load
       await this.page.waitForSelector(".job-view-layout .jobs-details", {
-        timeout: 15000,
+        timeout: 20000,
       });
 
-      // Get initial pages before clicking
-      const pagesBefore = await this.page.browser().pages();
+      // Store initial URL for comparison
+      const initialUrl = await this.page.url();
 
-      // Check and get apply button text with retry logic
-      let buttonText = null;
-      for (let i = 0; i < 3; i++) {
+      // Check for apply button with better selector coverage
+      const applyButtonSelectors = [
+        ".jobs-apply-button--top-card",
+        'button[data-control-name="jobdetails_topcard_inapply"]',
+        ".jobs-apply-button",
+      ];
+
+      let buttonHandle = null;
+      for (const selector of applyButtonSelectors) {
         try {
-          // Use evaluateHandle instead of evaluate for better stability
-          const buttonHandle = await this.page.waitForSelector(
-            ".jobs-apply-button--top-card",
-            {
-              timeout: 10000,
-            }
-          );
-
-          if (buttonHandle) {
-            buttonText = await this.page.evaluate(
-              (button) => button.textContent.trim(),
-              buttonHandle
-            );
-            await buttonHandle.dispose(); // Clean up the handle
-          }
-
-          if (buttonText) break;
-          await new Promise((resolve) => setTimeout(resolve, 2000)); // Increased wait between retries
+          buttonHandle = await this.page.waitForSelector(selector, {
+            timeout: 5000,
+            visible: true,
+          });
+          if (buttonHandle) break;
         } catch (e) {
-          console.log(`Attempt ${i + 1} to get button text failed:`, e);
+          continue;
         }
       }
 
-      if (!buttonText) {
+      if (!buttonHandle) {
         return {
           type: "error",
           url: null,
-          message: "Apply button not found after retries",
+          message: "Apply button not found",
         };
       }
 
-      console.log("Button text:", buttonText);
+      // Get button text
+      const buttonText = await this.page.evaluate((button) => {
+        return button.textContent.trim();
+      }, buttonHandle);
 
       if (buttonText.toLowerCase().includes("easy apply")) {
         return {
           type: "info",
           url: null,
-          message: "This is an Easy Apply job - skipping external application",
+          message: "Easy Apply job",
         };
       }
 
-      if (buttonText.includes("Apply")) {
-        // Set up new page listener before clicking
-        const newPagePromise = new Promise((resolve) => {
-          this.page.browser().once("targetcreated", async (target) => {
-            const newPage = await target.page();
-            resolve(newPage);
-          });
+      // Set up listeners for new pages and redirects
+      const navigationPromise = this.page
+        .waitForNavigation({
+          timeout: 30000,
+          waitUntil: "networkidle0",
+        })
+        .catch(() => null);
+
+      const newPagePromise = new Promise((resolve) => {
+        this.browser.once("targetcreated", async (target) => {
+          const newPage = await target.page();
+          resolve(newPage);
         });
+      });
 
-        // Enhanced click with retry logic and proper handle management
-        let clickSuccess = false;
-        for (let i = 0; i < 3; i++) {
+      // Click the apply button
+      await buttonHandle.click({ delay: 100 });
+
+      // Wait for either navigation or new page
+      const [newPage] = await Promise.all([
+        Promise.race([newPagePromise, navigationPromise]).catch(() => null),
+        // Add small delay to ensure URL changes are captured
+        new Promise((resolve) => setTimeout(resolve, 3000)),
+      ]);
+
+      // Handle new page case
+      if (newPage) {
+        let externalUrl = null;
+        let attempts = 0;
+        const maxAttempts = 10;
+
+        while (attempts < maxAttempts) {
           try {
-            // Get a fresh handle for each attempt
-            const buttonHandle = await this.page.waitForSelector(
-              ".jobs-apply-button--top-card",
-              {
-                timeout: 10000,
-              }
-            );
+            externalUrl = await newPage.url();
 
-            if (buttonHandle) {
-              // Ensure button is visible and clickable
-              await this.page.evaluate((button) => {
-                if (button.offsetParent !== null) {
-                  button.scrollIntoView({
-                    behavior: "smooth",
-                    block: "center",
-                  });
-                }
-              }, buttonHandle);
+            // Check if URL is valid and external
+            if (
+              externalUrl &&
+              externalUrl !== "about:blank" &&
+              !externalUrl.includes("linkedin.com")
+            ) {
+              // Wait for page to stabilize
+              await new Promise((resolve) => setTimeout(resolve, 2000));
 
-              // Wait for any animations to complete
-              await new Promise((resolve) => setTimeout(resolve, 1000));
+              // Close the new page to prevent too many open tabs
+              await newPage.close();
 
-              // Try different click methods
-              try {
-                await buttonHandle.click({ delay: 100 }); // Add slight delay to click
-              } catch (clickError) {
-                // Fallback to evaluate click if direct click fails
-                await this.page.evaluate(
-                  (button) => button.click(),
-                  buttonHandle
-                );
-              }
-
-              clickSuccess = true;
-              await buttonHandle.dispose(); // Clean up the handle
-              break;
-            }
-          } catch (e) {
-            console.log(`Attempt ${i + 1} to click button failed:`, e);
-            await new Promise((resolve) => setTimeout(resolve, 2000)); // Increased wait between retries
-          }
-        }
-
-        if (!clickSuccess) {
-          return {
-            type: "error",
-            url: null,
-            message: "Failed to click apply button after retries",
-          };
-        }
-
-        try {
-          // Wait for new page with increased timeout
-          const newPage = await Promise.race([
-            newPagePromise,
-            new Promise(
-              (_, reject) =>
-                setTimeout(() => reject(new Error("New page timeout")), 15000) // Increased timeout
-            ),
-          ]);
-
-          if (newPage) {
-            // Wait for the page to have a valid URL
-            let url = null;
-            let attempts = 0;
-            const maxAttempts = 15;
-
-            while (attempts < maxAttempts) {
-              try {
-                url = await newPage.url();
-
-                if (
-                  url &&
-                  url !== "about:blank" &&
-                  !url.includes("linkedin.com")
-                ) {
-                  // Wait for page to stabilize
-                  await new Promise((resolve) => setTimeout(resolve, 2000));
-
-                  return {
-                    type: "success",
-                    url: url,
-                    message: "Successfully captured external application URL",
-                  };
-                }
-
-                await new Promise((resolve) => setTimeout(resolve, 2000));
-                attempts++;
-              } catch (e) {
-                console.log(`URL fetch attempt ${attempts + 1} failed:`, e);
-                attempts++;
-              }
-            }
-          }
-        } catch (error) {
-          console.log("Error waiting for new page:", error);
-        }
-
-        // Enhanced fallback with retry
-        for (let i = 0; i < 3; i++) {
-          try {
-            const currentUrl = await this.page.url();
-            if (currentUrl && currentUrl !== pagesBefore[0].url()) {
               return {
                 type: "success",
-                url: currentUrl,
-                message: "Successfully captured URL from current page",
+                url: externalUrl,
+                message: "External application URL captured",
               };
             }
-            await new Promise((resolve) => setTimeout(resolve, 2000));
+
+            await new Promise((resolve) => setTimeout(resolve, 1000));
+            attempts++;
           } catch (e) {
-            console.log(`Fallback URL check attempt ${i + 1} failed:`, e);
+            attempts++;
           }
         }
+
+        // Clean up if we couldn't get the URL
+        if (newPage && !newPage.isClosed()) {
+          await newPage.close();
+        }
+      }
+
+      // Check current page URL as fallback
+      const currentUrl = await this.page.url();
+      if (currentUrl !== initialUrl && !currentUrl.includes("linkedin.com")) {
+        return {
+          type: "success",
+          url: currentUrl,
+          message: "External URL captured from current page",
+        };
+      }
+
+      // Check page content for application URL
+      const externalUrl = await this.page.evaluate(() => {
+        const applyLink = document.querySelector(
+          'a[data-tracking-control-name="public_jobs_apply-link-offsite_sign_up"]'
+        );
+        return applyLink ? applyLink.href : null;
+      });
+
+      if (externalUrl && !externalUrl.includes("linkedin.com")) {
+        return {
+          type: "success",
+          url: externalUrl,
+          message: "External URL found in page content",
+        };
       }
 
       return {
         type: "error",
         url: null,
-        message: "Could not capture application URL after all attempts",
+        message: "Could not capture external application URL",
       };
     } catch (error) {
       console.error("Error in handleApplyButton:", error);
       return {
         type: "error",
         url: null,
-        message: error.message,
+        message: error.message
       };
     }
   }
